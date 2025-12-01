@@ -159,6 +159,7 @@ python repo_merge.py -r "myrepo.part*.md" -n restored-repo --normalize-eol lf
 - `--verify` — After merging, perform a round-trip verification (merge → restore → compare checksums).
 - `--show-llm-instructions` — Print the embedded LLM instructions (the `LLM_INSTRUCTIONS` block) and exit.
 - `--show-llm-prompt` — Print a ready-to-use user prompt for an LLM and exit.
+- `-t, --txt` — Append `.txt` to all generated Markdown files (e.g., `.part001.md.txt`) for compatibility with LLMs that disallow `.md` uploads.
 
 ---
 

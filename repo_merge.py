@@ -8,13 +8,12 @@ large files across parts to ensure no part exceeds MAX_PART_SIZE.
 
 Also supports restoring a repository from Markdown parts or a zip archive.
 
-New features:
-- --verify: round-trip verification after merging (merge -> restore in tempdir -> compare checksums)
-- --normalize-eol: enforce LF or CRLF normalization when writing parts and when restoring
-- -s/--save-to: save outputs to a specific folder
-- --force-overwrite: skip interactive overwrite prompts
-- --show-llm-instructions: print the embedded LLM instructions and exit
-- --show-llm-prompt: print a ready-to-use user prompt for an LLM and exit
+Features:
+- Merge text files into Markdown parts named `<repo-name>.partNNN.md` (optionally `.md.txt` with -t).
+- Restore a repository from parts, zip, or wildcard.
+- Optional round-trip verification (--verify).
+- EOL normalization (--normalize-eol).
+- LLM onboarding instructions included in the first part (printable with --show-llm-instructions).
 """
 
 from __future__ import annotations
@@ -322,18 +321,13 @@ def build_llm_user_prompt() -> str:
     return prompt
 
 
-# ---------- Part writer and other components ----------
-# (The rest of the script is unchanged in structure; it uses LLM_INSTRUCTIONS where needed.)
-# For brevity and clarity the full implementation follows below (unchanged logic from previous version),
-# with references to LLM_INSTRUCTIONS and the new CLI flags integrated.
-
 # ---------- Part writer ----------
 
 class PartWriter:
     def __init__(self, base_out: Optional[Path], repo_name: str, repo_root: Path,
                  max_part_size: int, llm_prompt: Optional[str] = None, force_split: bool = False,
                  out_dir_override: Optional[Path] = None, force_overwrite: bool = False,
-                 normalize_eol: str = 'preserve'):
+                 normalize_eol: str = 'preserve', append_txt: bool = False):
         self.repo_name = repo_name
         self.repo_root = repo_root
         self.max_part_size = max_part_size
@@ -341,6 +335,7 @@ class PartWriter:
         self.force_split = force_split
         self.force_overwrite = force_overwrite
         self.normalize_eol = normalize_eol
+        self.append_txt = append_txt
 
         self.part_index = 1
         self.current_file = None
@@ -349,11 +344,18 @@ class PartWriter:
         if base_out:
             self.out_dir = base_out.parent
             name = base_out.name
-            if ".part" in name and name.lower().endswith(".md"):
-                idx = name.lower().rfind(".part")
+            # strip any trailing .md or .md.txt from provided base_out name
+            lower = name.lower()
+            if ".part" in lower and lower.endswith(".md"):
+                idx = lower.rfind(".part")
                 self.base_name = name[:idx]
             else:
-                self.base_name = name[:-3] if name.lower().endswith(".md") else name
+                if lower.endswith(".md.txt"):
+                    self.base_name = name[:-7]
+                elif lower.endswith(".md"):
+                    self.base_name = name[:-3]
+                else:
+                    self.base_name = name
         else:
             self.out_dir = Path.cwd()
             self.base_name = repo_name
@@ -361,8 +363,12 @@ class PartWriter:
         if out_dir_override:
             self.out_dir = out_dir_override
 
+        # check for existing outputs (consider .md and .md.txt)
         if self.out_dir.exists() and not self.force_overwrite:
-            existing = list(self.out_dir.glob(f"{self.base_name}.part*.md")) + list(self.out_dir.glob(f"{self.base_name}.summary.md")) + list(self.out_dir.glob(f"{self.base_name}-merged.zip"))
+            patterns = [f"{self.base_name}.part*.md", f"{self.base_name}.part*.md.txt", f"{self.base_name}.summary.md", f"{self.base_name}.summary.md.txt", f"{self.base_name}-merged.zip"]
+            existing = []
+            for pat in patterns:
+                existing.extend(list(self.out_dir.glob(pat)))
             if existing:
                 print(f"Output directory '{self.out_dir}' already contains files that may be overwritten.")
                 while True:
@@ -386,7 +392,10 @@ class PartWriter:
         self._open_new_part()
 
     def _part_filename(self, index: int) -> Path:
-        return self.out_dir / f"{self.base_name}.part{index:03d}.md"
+        name = f"{self.base_name}.part{index:03d}.md"
+        if self.append_txt:
+            name += ".txt"
+        return self.out_dir / name
 
     def _open_new_part(self):
         if self.current_file:
@@ -656,9 +665,12 @@ def render_tree(tree: Dict, prefix: str = "") -> List[str]:
     return lines
 
 
-def write_summary_file(repo_name: str, out_dir: Path, file_to_part: Dict[str, int], base_name: Optional[str] = None) -> Path:
+def write_summary_file(repo_name: str, out_dir: Path, file_to_part: Dict[str, int], base_name: Optional[str] = None, append_txt: bool = False) -> Path:
     summary_base = base_name if base_name else repo_name
-    summary_path = out_dir / f"{summary_base}.summary.md"
+    summary_name = f"{summary_base}.summary.md"
+    if append_txt:
+        summary_name += ".txt"
+    summary_path = out_dir / summary_name
     tree = build_tree_mapping(file_to_part)
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     lines: List[str] = []
@@ -675,12 +687,17 @@ def write_summary_file(repo_name: str, out_dir: Path, file_to_part: Dict[str, in
     return summary_path
 
 
-def create_zip_archive(out_dir: Path, repo_name: str, include_summary: bool, base_name: Optional[str] = None) -> Path:
+def create_zip_archive(out_dir: Path, repo_name: str, include_summary: bool, base_name: Optional[str] = None, append_txt: bool = False) -> Path:
     zip_name = f"{(base_name if base_name else repo_name)}-merged.zip"
     zip_path = out_dir / zip_name
     folder_prefix = f"{(base_name if base_name else repo_name)}-merged/"
-    files_to_zip = sorted([p for p in out_dir.glob("*.part*.md") if p.is_file()])
-    summary_path = out_dir / f"{(base_name if base_name else repo_name)}.summary.md"
+    # choose patterns depending on append_txt
+    part_pattern = "*.part*.md.txt" if append_txt else "*.part*.md"
+    files_to_zip = sorted([p for p in out_dir.glob(part_pattern) if p.is_file()])
+    summary_name = f"{(base_name if base_name else repo_name)}.summary.md"
+    if append_txt:
+        summary_name += ".txt"
+    summary_path = out_dir / summary_name
     if include_summary and summary_path.exists():
         files_to_zip.append(summary_path)
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -693,7 +710,7 @@ def create_zip_archive(out_dir: Path, repo_name: str, include_summary: bool, bas
 def write_markdown_parts(repo_root: Path, included: List[Path], ignored: List[Path], skipped_binary: List[Path],
                          out_path: Optional[Path], max_part_size: int, dry_run: bool, llm_prompt: Optional[str],
                          create_summary: bool, force_split: bool, save_to: Optional[Path], force_overwrite: bool,
-                         normalize_eol: str = 'preserve') -> Tuple[Path, Dict[str, int]]:
+                         normalize_eol: str = 'preserve', append_txt: bool = False) -> Tuple[Path, Dict[str, int]]:
     repo_name = repo_root.name
     base_out = out_path if out_path else None
     file_to_part: Dict[str, int] = {}
@@ -708,7 +725,7 @@ def write_markdown_parts(repo_root: Path, included: List[Path], ignored: List[Pa
     else:
         writer = PartWriter(base_out, repo_name, repo_root, max_part_size, llm_prompt=llm_prompt,
                             force_split=force_split, out_dir_override=out_dir_override, force_overwrite=force_overwrite,
-                            normalize_eol=normalize_eol)
+                            normalize_eol=normalize_eol, append_txt=append_txt)
         out_dir = writer.out_dir
 
     header_text = f"# Repository: {repo_name}\n\n## Files\n\n"
@@ -768,6 +785,7 @@ def write_markdown_parts(repo_root: Path, included: List[Path], ignored: List[Pa
                 print(line)
         return out_dir, planned_file_to_part
 
+    # Do not include ignored files listing per user request; include skipped binary files
     writer._write_raw("## Skipped binary files\n\n")
     if skipped_binary:
         for p in skipped_binary:
@@ -782,14 +800,20 @@ def write_markdown_parts(repo_root: Path, included: List[Path], ignored: List[Pa
     base_name = None
     if base_out:
         name = base_out.name
-        if ".part" in name and name.lower().endswith(".md"):
-            idx = name.lower().rfind(".part")
+        lower = name.lower()
+        if ".part" in lower and lower.endswith(".md"):
+            idx = lower.rfind(".part")
             base_name = name[:idx]
         else:
-            base_name = name[:-3] if name.lower().endswith(".md") else name
+            if lower.endswith(".md.txt"):
+                base_name = name[:-7]
+            elif lower.endswith(".md"):
+                base_name = name[:-3]
+            else:
+                base_name = name
 
     if create_summary:
-        summary_path = write_summary_file(repo_name, out_dir, file_to_part, base_name=base_name)
+        summary_path = write_summary_file(repo_name, out_dir, file_to_part, base_name=base_name, append_txt=append_txt)
         file_to_part[str(summary_path.name)] = 0
 
     return out_dir, file_to_part
@@ -880,7 +904,7 @@ def _collect_source_paths_for_restore(source: str) -> Tuple[List[Path], Optional
     paths: List[Path] = []
 
     if src.is_dir():
-        paths = sorted([p for p in src.glob("*.md") if p.is_file()])
+        paths = sorted([p for p in src.glob("*.md") if p.is_file()] + [p for p in src.glob("*.md.txt") if p.is_file()])
         return paths, None
 
     if src.is_file() and src.suffix.lower() == ".zip":
@@ -891,11 +915,11 @@ def _collect_source_paths_for_restore(source: str) -> Tuple[List[Path], Optional
         except Exception as e:
             shutil.rmtree(tempdir, ignore_errors=True)
             raise RuntimeError(f"Failed to extract zip: {e}")
-        paths = sorted([p for p in tempdir.rglob("*.md") if p.is_file()])
+        paths = sorted([p for p in tempdir.rglob("*.md") if p.is_file()] + [p for p in tempdir.rglob("*.md.txt") if p.is_file()])
         return paths, tempdir
 
     matched = sorted([Path(p) for p in glob.glob(source)])
-    paths = [p for p in matched if p.suffix.lower() == ".md" and p.is_file()]
+    paths = [p for p in matched if (p.suffix.lower() == ".md" or p.name.lower().endswith(".md.txt")) and p.is_file()]
     return paths, None
 
 
@@ -1124,27 +1148,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         prog="repo_merge.py",
         description="Merge text files from a local git repository into Markdown parts, or restore from parts."
     )
+    # Options sorted alphabetically by long option name
+    p.add_argument("-c", "--check", action="store_true", help="When restoring, verify restored files against SHA-1 checksums in the Markdown metadata.")
+    p.add_argument("-e", "--extensions", help="Comma-separated list of file extensions to include (e.g., .py,.md or py,md). If omitted, all text files are considered.")
     p.add_argument("-g", "--git-repo", help="Path to the repository root (for merge mode)")
-    p.add_argument("-o", "--output", help="Base output filename or path (optional). If omitted, defaults to <repo-name>.part001.md")
     p.add_argument("-m", "--max-size", default=DEFAULT_MAX_PART_SIZE,
                    help=f"Maximum bytes per part (e.g., 50M, 200K). Default: {DEFAULT_MAX_PART_SIZE}")
-    p.add_argument("-e", "--extensions", help="Comma-separated list of file extensions to include (e.g., .py,.md or py,md). If omitted, all text files are considered.")
-    p.add_argument("-x", "--dry-run", action="store_true", help="Do not write files; show how many parts would be produced and list files per part.")
-    p.add_argument("--no-gitignore", action="store_true", help="Ignore .gitignore and include all files in the repository.")
-    p.add_argument("--include-hidden", action="store_true", help="Include hidden files and folders (names starting with a dot). By default hidden files are skipped.")
-    p.add_argument("--no-summary", action="store_true", help="Do not create the <repo-name>.summary.md summary file.")
-    p.add_argument("-z", "--zip", action="store_true", help="Create a zip archive named <repo-name>-merged.zip containing all parts and the summary. Files inside the zip are placed under <repo-name>-merged/.")
-    p.add_argument("--force-split", action="store_true", help="Force split very large files across parts to not exceed MAX_PART_SIZE.")
-    p.add_argument("-r", "--restore", help="Restore a repository from Markdown parts, a zip file, or a wildcard path (e.g., /path/to/*.md).")
     p.add_argument("-n", "--new-name", help="New base folder name or path for restored repository. If omitted, original repo_name from metadata is used.")
-    p.add_argument("-c", "--check", action="store_true", help="When restoring, verify restored files against SHA-1 checksums in the Markdown metadata.")
-    p.add_argument("--list-files", action="store_true", help="When restoring, list files found in parts and which parts they appear in, then exit.")
+    p.add_argument("-o", "--output", help="Base output filename or path (optional). If omitted, defaults to <repo-name>.part001.md")
+    p.add_argument("-r", "--restore", help="Restore a repository from Markdown parts, a zip file, or a wildcard path (e.g., /path/to/*.md).")
     p.add_argument("-s", "--save-to", help="Folder path where merged markdown files and zip should be saved.")
+    p.add_argument("-t", "--txt", action="store_true", help="Append .txt to all generated Markdown files (e.g., .md.txt) for LLMs that disallow .md uploads.")
+    p.add_argument("-x", "--dry-run", action="store_true", help="Do not write files; show how many parts would be produced and list files per part.")
+    p.add_argument("-z", "--zip", action="store_true", help="Create a zip archive named <repo-name>-merged.zip containing all parts and the summary. Files inside the zip are placed under <repo-name>-merged/.")
     p.add_argument("--force-overwrite", action="store_true", help="Do not prompt before overwriting existing files or directories.")
+    p.add_argument("--force-split", action="store_true", help="Force split very large files across parts to not exceed MAX_PART_SIZE.")
+    p.add_argument("--include-hidden", action="store_true", help="Include hidden files and folders (names starting with a dot). By default hidden files are skipped.")
+    p.add_argument("--list-files", action="store_true", help="When restoring, list files found in parts and which parts they appear in, then exit.")
+    p.add_argument("--no-gitignore", action="store_true", help="Ignore .gitignore and include all files in the repository.")
+    p.add_argument("--no-summary", action="store_true", help="Do not create the <repo-name>.summary.md summary file.")
     p.add_argument("--normalize-eol", choices=['preserve', 'lf', 'crlf'], default='preserve', help="Normalize line endings when writing parts and when restoring. Default: preserve.")
-    p.add_argument("--verify", action="store_true", help="After merging, perform a round-trip verification (merge -> restore -> compare checksums).")
     p.add_argument("--show-llm-instructions", action="store_true", help="Print the embedded LLM instructions and exit.")
     p.add_argument("--show-llm-prompt", action="store_true", help="Print a ready-to-use user prompt for an LLM and exit.")
+    p.add_argument("--verify", action="store_true", help="After merging, perform a round-trip verification (merge -> restore -> compare checksums).")
     return p
 
 
@@ -1221,7 +1247,8 @@ def main(argv: Optional[List[str]] = None):
         force_split=args.force_split,
         save_to=save_to,
         force_overwrite=args.force_overwrite,
-        normalize_eol=args.normalize_eol
+        normalize_eol=args.normalize_eol,
+        append_txt=args.txt
     )
 
     if args.zip:
@@ -1229,34 +1256,51 @@ def main(argv: Optional[List[str]] = None):
         base_name = None
         if out_file:
             name = out_file.name
-            if ".part" in name and name.lower().endswith(".md"):
-                idx = name.lower().rfind(".part")
+            lower = name.lower()
+            if ".part" in lower and lower.endswith(".md"):
+                idx = lower.rfind(".part")
                 base_name = name[:idx]
             else:
-                base_name = name[:-3] if name.lower().endswith(".md") else name
+                if lower.endswith(".md.txt"):
+                    base_name = name[:-7]
+                elif lower.endswith(".md"):
+                    base_name = name[:-3]
+                else:
+                    base_name = name
         if args.dry_run:
             print("\nDry-run: planned zip archive")
             zip_name = f"{(base_name if base_name else repo_name)}-merged.zip"
             print(f"Zip name: {zip_name}")
             print(f"When unzipped, files will be placed into folder: {(base_name if base_name else repo_name)}-merged/")
-            planned_names = [f"{(base_name if base_name else repo_name)}.part{idx:03d}.md" for idx in range(1, len(file_to_part) + 2)]
-            for name in sorted(set(planned_names + [f"{(base_name if base_name else repo_name)}.summary.md"])):
+            if args.txt:
+                planned_names = [f"{(base_name if base_name else repo_name)}.part{idx:03d}.md.txt" for idx in range(1, len(file_to_part) + 2)]
+                planned_names.append(f"{(base_name if base_name else repo_name)}.summary.md.txt")
+            else:
+                planned_names = [f"{(base_name if base_name else repo_name)}.part{idx:03d}.md" for idx in range(1, len(file_to_part) + 2)]
+                planned_names.append(f"{(base_name if base_name else repo_name)}.summary.md")
+            for name in sorted(set(planned_names)):
                 print(f" - {name}")
         else:
-            zip_path = create_zip_archive(out_dir, repo_name, include_summary=not args.no_summary, base_name=base_name)
+            zip_path = create_zip_archive(out_dir, repo_name, include_summary=not args.no_summary, base_name=base_name, append_txt=args.txt)
             print(f"Zip created at: {zip_path}")
 
     if args.verify and not args.dry_run:
         if out_file:
             name = out_file.name
-            if ".part" in name and name.lower().endswith(".md"):
-                idx = name.lower().rfind(".part")
+            lower = name.lower()
+            if ".part" in lower and lower.endswith(".md"):
+                idx = lower.rfind(".part")
                 base_name = name[:idx]
             else:
-                base_name = name[:-3] if name.lower().endswith(".md") else name
+                if lower.endswith(".md.txt"):
+                    base_name = name[:-7]
+                elif lower.endswith(".md"):
+                    base_name = name[:-3]
+                else:
+                    base_name = name
         else:
             base_name = repo_root.name
-        parts_pattern = f"{base_name}.part*.md"
+        parts_pattern = f"{base_name}.part*.md.txt" if args.txt else f"{base_name}.part*.md"
         print("Starting round-trip verification...")
         ok = verify_round_trip(repo_root, out_dir, parts_pattern, included, args.normalize_eol)
         if not ok:
